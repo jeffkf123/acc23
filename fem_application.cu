@@ -94,6 +94,7 @@ void run_test(const long long N, const long long n_repeat)
   const MemorySpace host_space = MemorySpace::Host;
 
   SparseMatrix<Number> matrix = fill_sparse_matrix<Number>(N, host_space);
+  matrix.convertToCellCSigma();
   SparseMatrix<Number> matrix_dev = matrix.copy_to_device();
 
   Vector<Number>    src(N * N * N, host_space);
@@ -113,7 +114,7 @@ void run_test(const long long N, const long long n_repeat)
   Vector<Number> src_device = src.copy_to_device();
   Vector<Number> dst_device = dst.copy_to_device();
 
-  matrix_dev.apply(src_device, dst_device);
+   matrix_dev.applyCellCSigma(src_device, dst_device);
 
   dst = dst_device.copy_to_host();
 
@@ -147,7 +148,7 @@ void run_test(const long long N, const long long n_repeat)
     cudaDeviceSynchronize();
     const auto t1 = std::chrono::steady_clock::now();
     for (unsigned long long rep = 0; rep < n_repeat; ++rep)
-      matrix_dev.apply(src_device, dst_device);
+      matrix_dev.applyCellCSigma(src_device, dst_device);
     cudaDeviceSynchronize();
 
     const double time =
@@ -201,9 +202,9 @@ int main(int argc, char **argv)
   MPI_Init(&argc, &argv);
 #endif
 
-  long long          N           = -1;
+  long long          N           = 32;
   long long          n_repeat    = 100;
-  std::string        number      = "double";
+  std::string        number      = "float";
   const unsigned int my_mpi_rank = get_my_mpi_rank(MPI_COMM_WORLD);
 
   if (argc % 2 == 0)
