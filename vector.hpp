@@ -1,34 +1,94 @@
-
 #ifndef vector_hpp
 #define vector_hpp
 
 #include <omp.h>
-
 #include <memory>
 #include <utility>
 
 #ifndef HAVE_MPI
-
-
-////////////////// implementation of some utility functions //////////////////
-
-
-
-// define dummy values for some frequently used MPI commands in case we do not
-// have MPI
 using MPI_Comm           = int;
 const int MPI_COMM_SELF  = 0;
 const int MPI_COMM_WORLD = 1;
-
 #else
 #  include <mpi.h>
 #endif
-
 
 enum class MemorySpace
 {
   Host,
   CUDA
+};
+
+template <typename Number>
+class CellCSigmaMatrix
+{
+public:
+    static const int C = 32;  // Block size
+
+    CellCSigmaMatrix(std::size_t size)
+    : size(size)
+    {
+        values.resize(size);
+        column_indices.resize(size);
+        block_lengths.resize(size / C);
+    }
+
+    void computeOnHost(const std::vector<Number>& crs_values,
+                       const std::vector<int>& crs_column_indices,
+                       const std::vector<int>& crs_row_pointers)
+    {
+        // Convert CRS format to CELL-C-Sigma format
+        int block_idx = 0;
+        for (std::size_t row = 0; row < size; row += C)
+        {
+            for (std::size_t col = 0; col < size; col += C)
+            {
+                for (int i = 0; i < C; ++i)
+                {
+                    int crs_idx = crs_row_pointers[row + i];
+                    while (crs_idx < crs_row_pointers[row + i + 1] && crs_column_indices[crs_idx] < col + C)
+                    {
+                        values[block_idx] = crs_values[crs_idx];
+                        column_indices[block_idx] = crs_column_indices[crs_idx] % C;
+                        ++block_idx;
+                        ++crs_idx;
+                    }
+                }
+            }
+            block_lengths[row / C] = block_idx - (row / C) * C * C;
+        }
+    }
+
+    Vector<Number> multiply(const Vector<Number>& vec) const
+    {
+        Vector<Number> result(size, MemorySpace::Host);
+
+        int block_idx = 0;
+        for (std::size_t row = 0; row < size; row += C)
+        {
+            for (std::size_t col = 0; col < size; col += C)
+            {
+                for (int i = 0; i < C; ++i)
+                {
+                    Number sum = 0;
+                    for (int j = 0; j < block_lengths[row / C] / C; ++j)
+                    {
+                        sum += values[block_idx + j] * vec(col + column_indices[block_idx + j]);
+                    }
+                    result(row + i) += sum;
+                    block_idx += block_lengths[row / C] / C;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    std::vector<Number> values;
+    std::vector<int> column_indices;
+    std::vector<int> block_lengths;
+
+    std::size_t size;
 };
 
 unsigned int get_n_mpi_ranks(MPI_Comm communicator)
@@ -84,7 +144,6 @@ Number mpi_sum(const Number local_sum, MPI_Comm communicator)
 #endif
 }
 
-
 #ifdef DISABLE_CUDA
 #define AssertCuda(error_code)
 #else
@@ -97,8 +156,6 @@ Number mpi_sum(const Number local_sum, MPI_Comm communicator)
       std::abort();                                                     \
     }
 
-
-
 template <typename Number>
 __global__ void set_entries(const std::size_t N,
                             Number scalar,
@@ -109,49 +166,54 @@ __global__ void set_entries(const std::size_t N,
     destination[idx] = scalar;
 }
 
-
 template <typename Number>
 __global__ void vector_update(const std::size_t N,
-                              Number scalar1,
-                              Number scalar2,
+                              Number my_scalar,
+                              Number other_scalar,
                               const Number *source,
                               Number *destination)
 {
-  // TODO implement for GPU
-}
-
-
-template <unsigned int block_size, typename Number>
-__global__ void
-do_dot(unsigned int n, Number *vector1, Number *vector2, Number *result)
-{
-  __shared__ Number sdata[block_size];
-
-  unsigned int tid = threadIdx.x;
-  unsigned int i   = blockIdx.x * blockDim.x + tid;
-
-  if (i < n)
-    sdata[tid] = vector1[i] * vector2[i];
-  else
-    sdata[tid] = 0;
-  __syncthreads();
-
-  for (unsigned int s = block_size / 2; s > 0; s /= 2)
-    {
-      if (tid < s)
-        {
-          sdata[tid] += sdata[tid + s];
-          __syncthreads();
-        }
-    }
-
-  if (tid == 0)
-    atomicAdd(result, sdata[0]);
+  const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if (idx < N)
+    destination[idx] = my_scalar * destination[idx] + other_scalar * source[idx];
 }
 
 #endif
 
 
+template <int block_size, typename Number>
+__global__ void do_dot(const std::size_t N,
+                       const Number *    vec1,
+                       const Number *    vec2,
+                       Number *          result_device)
+{
+    __shared__ Number cache[block_size];
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int cacheIndex = threadIdx.x;
+
+    Number temp = 0;
+    while (tid < N)
+    {
+        temp += vec1[tid] * vec2[tid];
+        tid += blockDim.x * gridDim.x;
+    }
+
+    cache[cacheIndex] = temp;
+
+    __syncthreads();
+
+    int i = blockDim.x / 2;
+    while (i != 0)
+    {
+        if (cacheIndex < i)
+            cache[cacheIndex] += cache[cacheIndex + i];
+        __syncthreads();
+        i /= 2;
+    }
+
+    if (cacheIndex == 0)
+        atomicAdd(result_device, cache[0]);
+}
 
 /////////////////// implementation of actual vector class ///////////////////
 
@@ -362,42 +424,42 @@ public:
     return data;
   }
 
-  Vector copy_to_device()
+   Vector copy_to_device()
   {
     if (memory_space == MemorySpace::CUDA)
-      {
-        return *this;
-      }
+    {
+      return *this;
+    }
     else
-      {
-        Vector<Number> other(global_size,
-                             std::make_pair(locally_owned_range_start,
-                                            locally_owned_range_start +
+    {
+      Vector<Number> other(global_size,
+                           std::make_pair(locally_owned_range_start,
+                                          locally_owned_range_start +
                                               local_size),
-                             MemorySpace::CUDA,
-                             communicator);
-        // TODO implement copy from host to device for GPU
-        return other;
-      }
+                           MemorySpace::CUDA,
+                           communicator);
+      AssertCuda(cudaMemcpy(other.data, data, local_size * sizeof(Number), cudaMemcpyHostToDevice));
+      return other;
+    }
   }
 
   Vector copy_to_host()
   {
     if (memory_space == MemorySpace::CUDA)
-      {
-        Vector<Number> other(global_size,
-                             std::make_pair(locally_owned_range_start,
-                                            locally_owned_range_start +
+    {
+      Vector<Number> other(global_size,
+                           std::make_pair(locally_owned_range_start,
+                                          locally_owned_range_start +
                                               local_size),
-                             MemorySpace::Host,
-                             communicator);
-        // TODO implement copy from device to host for GPU
-        return other;
-      }
+                           MemorySpace::Host,
+                           communicator);
+      AssertCuda(cudaMemcpy(other.data, data, local_size * sizeof(Number), cudaMemcpyDeviceToHost));
+      return other;
+    }
     else
-      {
-        return *this;
-      }
+    {
+      return *this;
+    }
   }
 
   std::size_t size() const
